@@ -100,7 +100,7 @@ class ConverterThread(QThread):
                       f"Bonds: {stats['bonds']}\n"
                       f"Atom types: {stats['atom_types']}\n"
                       f"QM atoms: {stats['qm_atoms']}\n"
-                      f"Box size: {stats['box'][0]:.1f} x {stats['box'][1]:.1f} x {stats['box'][2]:.1f} Å\n\n"
+                      f"Box size: {stats['box'][0]:.1f} x {stats['box'][1]:.1f} x {stats['box'][2]:.1f} Angstroms\n\n"
                       f"Elements:\n")
             
             for elem, count in stats['elements'].items():
@@ -332,7 +332,7 @@ class ConverterWidget(QWidget):
         
         # Box padding
         pad_layout = QHBoxLayout()
-        pad_layout.addWidget(QLabel("Box padding (Å):"))
+        pad_layout.addWidget(QLabel("Box padding (Angstroms):"))
         self.box_padding = QDoubleSpinBox()
         self.box_padding.setRange(0.0, 20.0)
         self.box_padding.setValue(5.0)
