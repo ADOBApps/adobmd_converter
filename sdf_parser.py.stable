@@ -78,10 +78,10 @@ class SDFParser:
             
             i = 0
             while i < len(content):
-                mol_data, next_pos = self._parse_molecule(content, i)
+                mol_data = self._parse_molecule(content, i)
                 if mol_data:
                     self.molecules.append(mol_data)
-                    i = next_pos
+                    i = mol_data['end_line']
                 else:
                     i += 1
             
@@ -91,16 +91,15 @@ class SDFParser:
             print(f"Error parsing SDF file: {e}")
             return False
     
-    def _parse_molecule(self, lines: List[str], start: int) -> Tuple[Optional[Dict], int]:
-        """Parse a single molecule from the file
-        Returns: (molecule_dict, next_position)"""
+    def _parse_molecule(self, lines: List[str], start: int) -> Optional[Dict]:
+        """Parse a single molecule from the file"""
         try:
             if start >= len(lines):
-                return None, start + 1
+                return None
             
             # Header lines
             if len(lines[start].strip()) == 0:
-                return None, start + 1
+                return None
             
             mol = {
                 'name': lines[start].strip(),
@@ -113,17 +112,11 @@ class SDFParser:
             
             # Counts line
             if start + 3 >= len(lines):
-                return None, start + 4
+                return None
             
             counts_line = lines[start + 3]
-            try:
-                n_atoms = int(counts_line[0:3])
-                n_bonds = int(counts_line[3:6])
-            except ValueError:
-                # Try splitting method if fixed-width fails
-                parts = counts_line.split()
-                n_atoms = int(parts[0]) if len(parts) > 0 else 0
-                n_bonds = int(parts[1]) if len(parts) > 1 else 0
+            n_atoms = int(counts_line[0:3])
+            n_bonds = int(counts_line[3:6])
             
             # Parse atoms
             atom_start = start + 4
@@ -149,29 +142,27 @@ class SDFParser:
             
             # Find end of molecule ($$$$)
             current = bond_start + n_bonds
-            next_pos = current + 1
-            
             while current < len(lines):
                 if lines[current].strip() == '$$$$':
-                    next_pos = current + 1
+                    mol['end_line'] = current + 1
                     break
                 
                 # Parse properties (M lines)
                 if lines[current].startswith('> '):
-                    prop, prop_end = self._parse_property(lines, current)
+                    prop = self._parse_property(lines, current)
                     if prop:
                         mol['properties'].append(prop)
-                        current = prop_end
+                        current = prop['end_line']
                     else:
                         current += 1
                 else:
                     current += 1
             
-            return mol, next_pos
+            return mol
             
         except Exception as e:
             print(f"Error parsing molecule: {e}")
-            return None, start + 1
+            return None
     
     def _parse_atom_line(self, line: str) -> Optional[SDFAtom]:
         """Parse atom line in SDF format"""
@@ -224,9 +215,8 @@ class SDFParser:
             print(f"Error parsing bond line: {e}")
             return None
     
-    def _parse_property(self, lines: List[str], start: int) -> Tuple[Optional[Dict], int]:
-        """Parse property lines starting with '> '
-        Returns: (property_dict, next_position)"""
+    def _parse_property(self, lines: List[str], start: int) -> Optional[Dict]:
+        """Parse property lines starting with '> '"""
         try:
             header = lines[start].strip()
             
@@ -243,43 +233,20 @@ class SDFParser:
             
             value = '\n'.join(value_lines)
             
-            prop = {
+            return {
                 'name': name,
-                'value': value
+                'value': value,
+                'end_line': i + 1  # Skip the empty line
             }
-            
-            return prop, i + 1  # Skip the empty line
             
         except Exception as e:
             print(f"Error parsing property: {e}")
-            return None, start + 1
+            return None
     
     def get_first_molecule(self) -> Optional[Dict]:
-        """Get the first molecule in the file (cleaned)"""
-        if not self.molecules:
-            return None
-        
-        mol = self.molecules[0]
-        # Return a clean copy without any internal keys
-        return {
-            'name': mol.get('name', ''),
-            'program': mol.get('program', ''),
-            'comment': mol.get('comment', ''),
-            'atoms': mol.get('atoms', []),
-            'bonds': mol.get('bonds', []),
-            'properties': mol.get('properties', [])
-        }
+        """Get the first molecule in the file"""
+        return self.molecules[0] if self.molecules else None
     
     def get_all_molecules(self) -> List[Dict]:
-        """Get all molecules (cleaned)"""
-        clean_molecules = []
-        for mol in self.molecules:
-            clean_molecules.append({
-                'name': mol.get('name', ''),
-                'program': mol.get('program', ''),
-                'comment': mol.get('comment', ''),
-                'atoms': mol.get('atoms', []),
-                'bonds': mol.get('bonds', []),
-                'properties': mol.get('properties', [])
-            })
-        return clean_molecules
+        """Get all molecules"""
+        return self.molecules

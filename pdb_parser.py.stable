@@ -193,7 +193,7 @@ class PDBParser:
                 
                 # Bond if distance < sum of covalent radii * factor
                 cutoff = (r1 + r2) * self.bond_cutoff_factor
-                if 0.5 < dist < cutoff:  # Avoid self and too close
+                if dist < cutoff:
                     self.bonds.append(PDBBond(i + 1, j + 1))  # 1-based indices
     
     def get_coordinates(self) -> np.ndarray:
