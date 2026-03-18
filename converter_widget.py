@@ -24,10 +24,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 Copyright (C) [2026] Acxel David Orozco Baldomero
 """
 
-
 import os
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 import logging
 import numpy as np
 
@@ -43,6 +42,8 @@ from PySide6.QtGui import QFont
 
 from .pdb_parser import PDBParser
 from .sdf_parser import SDFParser
+from .xyz_parser import XYZParser
+from .cif_parser import CIFParser
 from .adobmd_writer import ADOBMDWriter
 
 class ConverterThread(QThread):
@@ -57,6 +58,7 @@ class ConverterThread(QThread):
         self.input_file = input_file
         self.output_file = output_file
         self.options = options
+        self.parser = None  # Store parser for later reference
     
     def run(self):
         try:
@@ -71,6 +73,10 @@ class ConverterThread(QThread):
                 success = self._parse_pdb(writer)
             elif ext == '.sdf':
                 success = self._parse_sdf(writer)
+            elif ext == '.xyz':
+                success = self._parse_xyz(writer)
+            elif ext == '.cif':
+                success = self._parse_cif(writer)
             else:
                 self.finished.emit(False, f"Unsupported file format: {ext}")
                 return
@@ -105,6 +111,12 @@ class ConverterThread(QThread):
             
             for elem, count in stats['elements'].items():
                 summary += f"  {elem}: {count}\n"
+            
+            # Add CIF-specific info
+            if ext == '.cif' and self.parser:
+                summary += f"\nCrystal Information:\n"
+                summary += f"  Space Group: {self.parser.get_space_group()}\n"
+                summary += f"  Cell Volume: {self.parser.get_cell_volume():.2f} Å³\n"
             
             self.finished.emit(True, summary)
             
@@ -206,6 +218,103 @@ class ConverterThread(QThread):
         
         return True
 
+    def _parse_xyz(self, writer: ADOBMDWriter) -> bool:
+        """Parse XYZ file and populate writer"""
+        parser = XYZParser(bond_cutoff_factor=self.options.get('bond_cutoff', 1.2))
+        
+        frame = self.options.get('xyz_frame', 0)
+        if not parser.parse(self.input_file, frame):
+            return False
+        
+        # Set title
+        writer.title = parser.title or Path(self.input_file).stem
+        
+        # Determine QM atoms
+        qm_by_molecule = self.options.get('qm_by_molecule', False)
+        qm_molecules = self.options.get('qm_molecules', [])
+        
+        # Add atoms
+        for i, atom in enumerate(parser.atoms):
+            is_qm = False
+            
+            if self.options.get('first_n_qm', 0) > 0:
+                is_qm = i < self.options['first_n_qm']
+            elif self.options.get('qm_indices'):
+                is_qm = (i + 1) in self.options['qm_indices']
+            
+            writer.add_atom(
+                element=atom.element,
+                x=atom.x,
+                y=atom.y,
+                z=atom.z,
+                molecule_id=1,  # XYZ doesn't have residue info
+                charge=0.0,
+                is_qm=is_qm,
+                mass=atom.mass
+            )
+        
+        # Add bonds
+        for bond in parser.bonds:
+            writer.add_bond(bond[0], bond[1], bond[2])
+        
+        # Set box
+        box_size = parser.get_box_size(padding=self.options.get('box_padding', 5.0))
+        writer.set_box(box_size[0], box_size[1], box_size[2])
+        
+        return True
+
+    def _parse_cif(self, writer: ADOBMDWriter) -> bool:
+        """Parse CIF file and populate writer"""
+        supercell = (
+            self.options.get('supercell_nx', 1),
+            self.options.get('supercell_ny', 1),
+            self.options.get('supercell_nz', 1)
+        )
+        
+        apply_symmetry = self.options.get('apply_symmetry', True)
+        self.parser = CIFParser(supercell=supercell)
+        
+        if not self.parser.parse(self.input_file, apply_symmetry=apply_symmetry):
+            return False
+        
+        # Set title
+        writer.title = self.parser.title or Path(self.input_file).stem
+        
+        # Determine QM atoms
+        qm_by_molecule = self.options.get('qm_by_molecule', False)
+        qm_molecules = self.options.get('qm_molecules', [])
+        
+        # Add atoms
+        for i, atom in enumerate(self.parser.atoms):
+            is_qm = False
+            
+            if self.options.get('first_n_qm', 0) > 0:
+                is_qm = i < self.options['first_n_qm']
+            elif self.options.get('qm_indices'):
+                is_qm = (i + 1) in self.options['qm_indices']
+            
+            writer.add_atom(
+                element=atom.element,
+                x=atom.cart_x,
+                y=atom.cart_y,
+                z=atom.cart_z,
+                molecule_id=1,
+                charge=0.0,
+                is_qm=is_qm,
+                mass=atom.mass
+            )
+        
+        # Add bonds
+        for bond in self.parser.bonds:
+            writer.add_bond(bond[0], bond[1], bond[2])
+        
+        # Set box (use unit cell dimensions)
+        box_size = self.parser.get_box_size()
+        writer.set_box(box_size[0], box_size[1], box_size[2], padding=0.0)
+        
+        return True
+
+
 class ConverterWidget(QWidget):
     """Main widget for ADOBMD Converter"""
     
@@ -214,6 +323,8 @@ class ConverterWidget(QWidget):
         self.plugin = plugin_instance
         self.converter_thread = None
         self.input_file = ""
+        self.current_xyz_parser = None
+        self.current_cif_parser = None
         self.init_ui()
     
     def init_ui(self):
@@ -352,13 +463,64 @@ class ConverterWidget(QWidget):
         cutoff_layout.addStretch()
         layout.addLayout(cutoff_layout)
         
+        # CIF Supercell options
+        cif_group = QGroupBox("CIF Options")
+        cif_layout = QVBoxLayout()
+        
+        # Supercell expansion
+        supercell_layout = QHBoxLayout()
+        supercell_layout.addWidget(QLabel("Supercell size:"))
+        
+        self.supercell_nx = QSpinBox()
+        self.supercell_nx.setRange(1, 10)
+        self.supercell_nx.setValue(1)
+        self.supercell_nx.valueChanged.connect(self.on_supercell_changed)
+        supercell_layout.addWidget(QLabel("X:"))
+        supercell_layout.addWidget(self.supercell_nx)
+        
+        self.supercell_ny = QSpinBox()
+        self.supercell_ny.setRange(1, 10)
+        self.supercell_ny.setValue(1)
+        self.supercell_ny.valueChanged.connect(self.on_supercell_changed)
+        supercell_layout.addWidget(QLabel("Y:"))
+        supercell_layout.addWidget(self.supercell_ny)
+        
+        self.supercell_nz = QSpinBox()
+        self.supercell_nz.setRange(1, 10)
+        self.supercell_nz.setValue(1)
+        self.supercell_nz.valueChanged.connect(self.on_supercell_changed)
+        supercell_layout.addWidget(QLabel("Z:"))
+        supercell_layout.addWidget(self.supercell_nz)
+        
+        supercell_layout.addStretch()
+        cif_layout.addLayout(supercell_layout)
+        
+        # Apply symmetry option
+        self.apply_symmetry = QCheckBox("Apply symmetry operations to generate full unit cell")
+        self.apply_symmetry.setChecked(True)
+        self.apply_symmetry.stateChanged.connect(self.on_supercell_changed)
+        cif_layout.addWidget(self.apply_symmetry)
+        
+        cif_group.setLayout(cif_layout)
+        layout.addWidget(cif_group)
+        
         # Auto-detect bonds
         self.auto_bonds = QCheckBox("Auto-detect bonds (if not in file)")
         self.auto_bonds.setChecked(True)
         layout.addWidget(self.auto_bonds)
         
         layout.addStretch()
+        
+        # Initially hide CIF options
+        cif_group.setVisible(False)
+        self.cif_group = cif_group
+        
         return widget
+
+    def _show_cif_options(self, show: bool):
+        """Show or hide CIF-specific options"""
+        if hasattr(self, 'cif_group'):
+            self.cif_group.setVisible(show)
     
     def create_qm_tab(self) -> QWidget:
         """Create QM region options tab"""
@@ -438,10 +600,15 @@ class ConverterWidget(QWidget):
             self.atom_indices.setVisible(True)
     
     def select_input_file(self):
-        """Select input file"""
-        file_path, _ = QFileDialog.getOpenFileName(
+        """Select input file with format-specific options"""
+        file_path, selected_filter = QFileDialog.getOpenFileName(
             self, "Select Input File", "",
-            "Supported Files (*.pdb *.sdf);;PDB Files (*.pdb);;SDF Files (*.sdf);;All Files (*)"
+            "Supported Files (*.pdb *.sdf *.xyz *.cif);;"
+            "PDB Files (*.pdb);;"
+            "SDF Files (*.sdf);;"
+            "XYZ Files (*.xyz);;"
+            "CIF Files (*.cif);;"
+            "All Files (*)"
         )
         
         if file_path:
@@ -450,7 +617,26 @@ class ConverterWidget(QWidget):
             self.convert_btn.setEnabled(True)
             self.output_display.clear()
             self.output_display.append(f"Selected: {file_path}")
-            self._preview_file(file_path)
+            
+            # Store parser instance for current file
+            ext = Path(file_path).suffix.lower()
+            if ext == '.xyz':
+                self._show_cif_options(False)
+                self.current_xyz_parser = XYZParser()
+                if self.current_xyz_parser.parse(file_path):
+                    self._preview_file(file_path)
+            elif ext == '.cif':
+                # Show CIF-specific options
+                self._show_cif_options(True)
+                # Create parser with current settings
+                supercell = self._get_supercell_from_ui()
+                apply_symmetry = self.apply_symmetry.isChecked()
+                self.current_cif_parser = CIFParser(supercell=supercell)
+                if self.current_cif_parser.parse(file_path, apply_symmetry=apply_symmetry):
+                    self._preview_file(file_path)
+            else:
+                self._show_cif_options(False)
+                self._preview_file(file_path)
     
     def select_output_file(self):
         """Select output file"""
@@ -492,16 +678,79 @@ class ConverterWidget(QWidget):
                         # Update bond table
                         self._update_bond_table(mol['bonds'])
             
+            elif ext == '.xyz':
+                if hasattr(self, 'current_xyz_parser') and self.current_xyz_parser:
+                    parser = self.current_xyz_parser
+                    self.output_display.append(f"\nXYZ File Summary:")
+                    self.output_display.append(f"  Atoms: {len(parser.atoms)}")
+                    self.output_display.append(f"  Bonds: {len(parser.bonds)}")
+                    self.output_display.append(f"  Comment: {parser.comment}")
+                    
+                    if parser.has_multiple_frames:
+                        self.output_display.append(f"  Frames: {parser.get_frame_count()}")
+                        self.output_display.append(f"  Current frame: 0")
+                        
+                        # Add frame selector to UI if needed
+                        self._show_frame_selector(parser.get_frame_count())
+                    
+                    # Update bond table
+                    self._update_bond_table(parser.bonds)
+            
+            elif ext == '.cif':
+                if hasattr(self, 'current_cif_parser') and self.current_cif_parser:
+                    parser = self.current_cif_parser
+                    self.output_display.append(f"\nCIF File Summary:")
+                    self.output_display.append(f"  Atoms: {len(parser.atoms)}")
+                    self.output_display.append(f"  Bonds: {len(parser.bonds)}")
+                    self.output_display.append(f"  Space Group: {parser.get_space_group()}")
+                    self.output_display.append(f"  Unit Cell:")
+                    self.output_display.append(f"    a = {parser.frame.a:.3f} Å")
+                    self.output_display.append(f"    b = {parser.frame.b:.3f} Å")
+                    self.output_display.append(f"    c = {parser.frame.c:.3f} Å")
+                    self.output_display.append(f"    alpha = {parser.frame.alpha:.2f}°")
+                    self.output_display.append(f"    beta = {parser.frame.beta:.2f}°")
+                    self.output_display.append(f"    gamma = {parser.frame.gamma:.2f}°")
+                    self.output_display.append(f"    Volume = {parser.frame.volume:.2f} Å³")
+                    self.output_display.append(f"  Formula: {parser.frame.cell_formula}")
+                    
+                    # Show symmetry info
+                    if hasattr(parser, 'symmetry_ops') and parser.symmetry_ops:
+                        self.output_display.append(f"  Symmetry operations: {len(parser.symmetry_ops)}")
+                    
+                    # Show supercell info if expanded
+                    if parser.supercell != (1, 1, 1):
+                        nx, ny, nz = parser.supercell
+                        self.output_display.append(f"  Supercell: {nx}×{ny}×{nz}")
+                    
+                    # Update bond table
+                    self._update_bond_table(parser.bonds)
+            
+            else:
+                self.output_display.append(f"\nUnsupported file format: {ext}")
+                
         except Exception as e:
             self.output_display.append(f"Preview error: {e}")
+            import traceback
+            traceback.print_exc()
     
     def _update_bond_table(self, bonds):
         """Update bond table with preview data"""
         self.bond_table.setRowCount(len(bonds))
         for i, bond in enumerate(bonds[:100]):  # Limit to first 100 bonds
-            self.bond_table.setItem(i, 0, QTableWidgetItem(str(bond.atom1)))
-            self.bond_table.setItem(i, 1, QTableWidgetItem(str(bond.atom2)))
-            self.bond_table.setItem(i, 2, QTableWidgetItem(str(bond.bond_type)))
+            if hasattr(bond, 'atom1'):  # It's an object with attributes (like PDBBond, SDFBond)
+                self.bond_table.setItem(i, 0, QTableWidgetItem(str(bond.atom1)))
+                self.bond_table.setItem(i, 1, QTableWidgetItem(str(bond.atom2)))
+                bond_type = getattr(bond, 'bond_type', 1)
+                self.bond_table.setItem(i, 2, QTableWidgetItem(str(bond_type)))
+            elif isinstance(bond, tuple) and len(bond) >= 2:  # It's a tuple (atom1, atom2, bond_type)
+                self.bond_table.setItem(i, 0, QTableWidgetItem(str(bond[0])))
+                self.bond_table.setItem(i, 1, QTableWidgetItem(str(bond[1])))
+                bond_type = bond[2] if len(bond) >= 3 else 1
+                self.bond_table.setItem(i, 2, QTableWidgetItem(str(bond_type)))
+            elif isinstance(bond, dict):  # It's a dictionary
+                self.bond_table.setItem(i, 0, QTableWidgetItem(str(bond.get('atom1', bond.get('atom_i', '')))))
+                self.bond_table.setItem(i, 1, QTableWidgetItem(str(bond.get('atom2', bond.get('atom_j', '')))))
+                self.bond_table.setItem(i, 2, QTableWidgetItem(str(bond.get('bond_type', 1))))
     
     def start_conversion(self):
         """Start conversion in background thread"""
@@ -522,6 +771,14 @@ class ConverterWidget(QWidget):
             'auto_detect_bonds': self.auto_bonds.isChecked(),
             'save_qm_region': self.save_qm_check.isChecked()
         }
+        
+        # Add CIF-specific options
+        ext = Path(self.input_file).suffix.lower()
+        if ext == '.cif':
+            options['supercell_nx'] = self.supercell_nx.value()
+            options['supercell_ny'] = self.supercell_ny.value()
+            options['supercell_nz'] = self.supercell_nz.value()
+            options['apply_symmetry'] = self.apply_symmetry.isChecked()
         
         # QM region options
         method = self.qm_method.currentText()
@@ -581,3 +838,55 @@ class ConverterWidget(QWidget):
                                f"Conversion failed:\n{message}")
         
         self.progress_bar.setVisible(False)
+
+    def _show_frame_selector(self, frame_count: int):
+        """Show frame selector for multi-frame XYZ files"""
+        # Check if frame selector already exists
+        if hasattr(self, 'frame_selector') and self.frame_selector:
+            self.frame_selector.setMaximum(frame_count - 1)
+            self.frame_selector.setVisible(True)
+            return
+        
+        # Create frame selector layout
+        frame_layout = QHBoxLayout()
+        frame_layout.addWidget(QLabel("Frame:"))
+        
+        self.frame_selector = QSpinBox()
+        self.frame_selector.setRange(0, frame_count - 1)
+        self.frame_selector.setValue(0)
+        self.frame_selector.valueChanged.connect(self.on_frame_changed)
+        frame_layout.addWidget(self.frame_selector)
+        
+        frame_layout.addStretch()
+        
+        # Add to main layout (after file selection group)
+        layout = self.layout()
+        layout.insertLayout(2, frame_layout)
+
+    def on_frame_changed(self, frame: int):
+        """Handle frame selection change for XYZ files"""
+        if hasattr(self, 'current_xyz_parser') and self.current_xyz_parser:
+            if self.current_xyz_parser.load_frame(frame):
+                self.output_display.append(f"\nLoaded frame {frame}")
+                self.output_display.append(f"  Atoms: {len(self.current_xyz_parser.atoms)}")
+                self.output_display.append(f"  Comment: {self.current_xyz_parser.comment}")
+                self._update_bond_table(self.current_xyz_parser.bonds)
+
+    def _get_supercell_from_ui(self) -> Tuple[int, int, int]:
+        """Get supercell dimensions from UI"""
+        if hasattr(self, 'supercell_nx'):
+            return (self.supercell_nx.value(), 
+                    self.supercell_ny.value(), 
+                    self.supercell_nz.value())
+        return (1, 1, 1)
+
+    def on_supercell_changed(self):
+        """Handle supercell value changes"""
+        if hasattr(self, 'current_cif_parser') and self.current_cif_parser and self.input_file:
+            # Update parser with new settings
+            supercell = self._get_supercell_from_ui()
+            apply_symmetry = self.apply_symmetry.isChecked()
+            self.current_cif_parser.supercell = supercell
+            # Re-parse with new settings
+            if self.current_cif_parser.parse(self.input_file, apply_symmetry=apply_symmetry):
+                self._preview_file(self.input_file)
